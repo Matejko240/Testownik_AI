@@ -29,6 +29,26 @@ curl -X POST http://127.0.0.1:8000/gen/yn  -H "Content-Type: application/json" -
 # 4) ocena pytania (feedback)
 curl -X POST http://127.0.0.1:8000/rate -H "Content-Type: application/json" -d "{`"question_id`":`"<ID>`",`"score`":9,`"feedback`":`"OK"`}"
 
+Format odpowiedzi (przykład)
+{
+  "question_id": "a8c856ef-3aae-4251-90df-e3aa58ca84d8",
+  "question": {
+    "kind": "MCQ",
+    "stem": "Które stwierdzenie wynika z materiału? ...",
+    "options": ["a) ...", "b) ...", "c) ...", "d) ..."],
+    "answer": "a",
+    "explanation": "Uzasadnienie oparte na cytowanych fragmentach.",
+    "metadata": {
+      "topic": "general",
+      "difficulty": "medium",
+      "timestamp": "2025-10-25T13:04:31.001193Z"
+    },
+    "citations": [
+      { "source": "SP-W03.pdf", "page": 48, "quote": "Analogicznie wygląda przykład w MicroPython" }
+    ]
+  }
+}
+
 Endpoints (skrót)
 Method	Path	Body	Opis
 POST	/upload	files=@plik (multipart, wiele plików)	Indeksacja PDF/PPTX/DOCX/EPUB.
