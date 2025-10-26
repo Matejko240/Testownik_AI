@@ -9,3 +9,5 @@ faiss-cpu==1.8.0
 sentence-transformers==3.0.1
 python-dotenv==1.0.1
 openai==1.43.0
+tensorflow==2.20.*
+tf-keras==2.20.*
