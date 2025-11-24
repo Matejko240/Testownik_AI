@@ -3,7 +3,7 @@ import os
 
 class Settings(BaseModel):
     host: str = os.getenv("APP_HOST","127.0.0.1")
-    port: int = int(os.getenv("APP_PORT","9000"))
+    port: int = int(os.getenv("APP_PORT","8000"))
     db_path: str = "data/index/testownik.db"
     index_dir: str = "data/index"
     src_dir: str = "data/sources"

@@ -3,9 +3,17 @@ from ..settings import settings
 from .llm import ask_llm  # korzysta z providers/*, albo zwraca None
 
 def _flatten_ctx(ctx):
-    citations = [{"source":c["source"],"page":c["page"],"quote":c["quote"]} for c in ctx]
+    seen = set()
+    citations = []
+    for c in ctx:
+        key = (c["source"], c["page"], c["quote"])
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append({"source": c["source"], "page": c["page"], "quote": c["quote"]})
     ctx_txt = "\n".join([f"[{c['source']}|p.{c['page']}] {c['text']}" for c in ctx])[:8000]
     return ctx_txt, citations
+
 
 def _meta(topic, diff):
     return {"topic": topic or "general", "difficulty": diff or "medium",
