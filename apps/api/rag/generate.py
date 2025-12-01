@@ -19,7 +19,7 @@ def _meta(topic, diff):
     return {"topic": topic or "general", "difficulty": diff or "medium",
             "timestamp": datetime.datetime.utcnow().isoformat()+"Z"}
 
-def gen_yes_no(ctx, difficulty="medium"):
+def gen_yes_no(ctx, topic=None, difficulty="medium"):
     body, cites = _flatten_ctx(ctx)
     prompt = f"""Użyj wyłącznie poniższych fragmentów i wygeneruj jedno pytanie TAK/NIE.
 Zwróć JSON: {{"stem":str,"answer":"TAK"|"NIE","explanation":str,"citations":[{{source,page,quote}}]}}.
@@ -28,16 +28,16 @@ Fragmenty:
 """
     llm = ask_llm(prompt)
     if llm:
-        q = json.loads(llm); q["kind"]="YN"; q["metadata"]=_meta(None,difficulty); q["citations"]=cites
+        q = json.loads(llm); q["kind"]="YN"; q["metadata"]=_meta(topic,difficulty); q["citations"]=cites
         return q
     # fallback heurystyczny (zawsze działa offline)
     base = ctx[0]["text"].split(".")[0]
     return {"kind":"YN","stem":f"Czy to prawda? {base.strip()}.",
             "answer":random.choice(["TAK","NIE"]),
             "explanation":"Wniosek na podstawie cytowanych fragmentów.",
-            "metadata":_meta(None,difficulty),"citations":cites}
+            "metadata":_meta(topic,difficulty),"citations":cites}
 
-def gen_mcq(ctx, difficulty="medium"):
+def gen_mcq(ctx, topic=None, difficulty="medium"):
     body, cites = _flatten_ctx(ctx)
     prompt = f"""Użyj wyłącznie fragmentów poniżej i wygeneruj jedno pytanie ABCD.
 Zwróć JSON: {{"stem":str,"options":[str,str,str,str],"answer":"a"|"b"|"c"|"d","explanation":str,"citations":[...]}}.
@@ -46,7 +46,7 @@ Fragmenty:
 """
     llm = ask_llm(prompt)
     if llm:
-        q = json.loads(llm); q["kind"]="MCQ"; q["metadata"]=_meta(None,difficulty); q["citations"]=cites
+        q = json.loads(llm); q["kind"]="MCQ"; q["metadata"]=_meta(topic,difficulty); q["citations"]=cites
         return q
     # fallback
     base = ctx[0]["text"].split(".")[0]
@@ -54,4 +54,4 @@ Fragmenty:
     return {"kind":"MCQ","stem":f"Które stwierdzenie wynika z materiału? {base.strip()}.",
             "options":[f"a) {options[0]}",f"b) {options[1]}",f"c) {options[2]}",f"d) {options[3]}"],
             "answer":"a","explanation":"a) wynika z cytowanych fragmentów.",
-            "metadata":_meta(None,difficulty),"citations":cites}
+            "metadata":_meta(topic,difficulty),"citations":cites}

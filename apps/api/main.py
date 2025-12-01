@@ -50,7 +50,7 @@ def search(req: SearchReq):
 @app.post("/gen/yn")
 def gen_yn(req: GenReq):
     ctx = rag_search(req.topic or "przegląd materiału", k=8, db_path=settings.db_path)
-    q = gen_yes_no(ctx, difficulty=req.difficulty)
+    q = gen_yes_no(ctx, topic=req.topic, difficulty=req.difficulty)
     qid = str(uuid.uuid4())
     save_question_with_citations(qid, q, db_path=settings.db_path)
     return {"question_id": qid, "question": q}
@@ -58,7 +58,7 @@ def gen_yn(req: GenReq):
 @app.post("/gen/mcq")
 def generate_mcq(req: GenReq):  # ← inna nazwa funkcji endpointu
     ctx = rag_search(req.topic or "przegląd materiału", k=10, db_path=settings.db_path)
-    q = gen_mcq(ctx, difficulty=req.difficulty)  # ← to jest funkcja z rag.generate
+    q = gen_mcq(ctx,topic=req.topic, difficulty=req.difficulty)  # ← to jest funkcja z rag.generate
     qid = str(uuid.uuid4())
     save_question_with_citations(qid, q, db_path=settings.db_path)
     return {"question_id": qid, "question": q}
