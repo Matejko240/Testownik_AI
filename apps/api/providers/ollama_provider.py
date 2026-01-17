@@ -25,7 +25,7 @@ class OllamaProvider(LLMProvider):
         r = requests.post(
             f"{self.base_url}/api/generate",
             json=payload,
-            timeout=(5, 180)
+            timeout=(5, 120)
         )
 
         if r.status_code != 200:

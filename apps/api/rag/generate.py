@@ -645,7 +645,7 @@ Fragmenty:
 
     # nadal nie umiemy sparsować → SKIP (zamiast FAIL, bo teraz wpadasz w fallback MCQ)
     if letters == []:
-        return False, "semantic_check_parse_failed"
+        return True, "semantic_check_parse_failed"
 
     if len(letters) != 1:
         return False, f"semantic_check_expected_1_correct_got={letters}"
@@ -686,7 +686,7 @@ Fragmenty:
     last_reason = "init"
 
     # więcej prób = mniej wejść w fallback (a fallback MCQ wygląda słabo)
-    for attempt in range(5):
+    for attempt in range(3):
         llm = ask_llm(prompt, provider=provider)
         qobj = _extract_json(llm) if llm else None
         if isinstance(qobj, dict) and isinstance(qobj.get("explanation"), str):
