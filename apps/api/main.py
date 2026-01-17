@@ -101,14 +101,6 @@ def providers():
 def get_sources(limit: int = 1000, offset: int = 0):
     """Lista wszystkich źródeł w bazie (z paginacją)."""
     return list_sources(settings.db_path, limit=limit, offset=offset)
-@app.post("/sources/backfill")
-def sources_backfill():
-    """
-    Uzupełnia sha256 dla rekordów w tabeli sources, jeśli puste.
-    Zwraca liczbę zaktualizowanych rekordów.
-    """
-    updated = backfill_sources_sha256(settings.db_path, settings.src_dir)
-    return {"updated": int(updated)}
 
 @app.delete("/sources")
 def clear_sources():
