@@ -28,12 +28,16 @@ CREATE TABLE IF NOT EXISTS questions (
   answer TEXT NOT NULL,      -- 'TAK'/'NIE' lub 'a'|'b'|'c'|'d'
   explanation TEXT NOT NULL,
   metadata JSON,             -- {topic,difficulty,timestamp,...}
+  fingerprint TEXT,
   created_at TEXT NOT NULL
 );
 
+-- index MUSI być po CREATE TABLE questions
+CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_fingerprint ON questions(fingerprint);
+
 CREATE TABLE IF NOT EXISTS question_citations (
   question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
-  source_id INTEGER NOT NULL REFERENCES sources(id),
+  source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   page INTEGER NOT NULL,
   quote TEXT NOT NULL,
   PRIMARY KEY (question_id, source_id, page, quote)

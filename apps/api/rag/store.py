@@ -1,11 +1,119 @@
-import sqlite3, json, os, hashlib
+import sqlite3, json, os, hashlib, re
+
+# -----------------------------
+# Question de-duplication
+# -----------------------------
+
+_WS_RX = re.compile(r"\s+")
+_NONWORD_RX = re.compile(r"[^0-9a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]+")
+
+
+def _norm_text(s: str | None) -> str:
+    """Normalizacja tekstu do fingerprintu (prosta, stabilna)."""
+    if not s:
+        return ""
+    t = s.strip().lower()
+    t = _NONWORD_RX.sub(" ", t)
+    t = _WS_RX.sub(" ", t).strip()
+    return t
+
+
+def make_question_fingerprint(kind: str, stem: str, options: list[str] | None = None) -> str:
+    """Stabilny hash pytania do wykrywania duplikatów."""
+    base = f"{(kind or '').strip().upper()}|{_norm_text(stem)}"
+    if options:
+        for o in options:
+            base += "|" + _norm_text(o)
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+def get_question_id_by_fingerprint(fingerprint: str, db_path: str) -> str | None:
+    """Zwraca id pytania, jeśli fingerprint już istnieje w bazie."""
+    if not fingerprint:
+        return None
+    con = _connect(db_path)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT id FROM questions WHERE fingerprint=? LIMIT 1", (fingerprint,))
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+    finally:
+        con.close()
+
+
+def list_recent_question_stems(
+    db_path: str, kind: str, topic: str | None = None, limit: int = 40
+) -> list[str]:
+    """Krótka lista ostatnich stemów (do 'banlist' w promptach)."""
+    limit = max(1, min(int(limit), 200))
+    con = _connect(db_path)
+    try:
+        cur = con.cursor()
+        if topic:
+            # SQLite ma json_extract jeśli jest build z JSON1 (często jest).
+            # Jeśli nie ma, poleci fallback niżej.
+            try:
+                cur.execute(
+                    """
+                    SELECT stem
+                    FROM questions
+                    WHERE kind=?
+                      AND json_extract(metadata, '$.topic')=?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (kind, topic, limit),
+                )
+                return [r[0] for r in cur.fetchall() if r and r[0]]
+            except Exception:
+                pass
+
+        cur.execute(
+            """
+            SELECT stem
+            FROM questions
+            WHERE kind=?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (kind, limit),
+        )
+        return [r[0] for r in cur.fetchall() if r and r[0]]
+    finally:
+        con.close()
+
+
+def backfill_questions_fingerprint(db_path: str) -> dict:
+    """Uzupełnia fingerprint dla starych pytań (po dodaniu kolumny)."""
+    con = _connect(db_path)
+    updated = 0
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT id, kind, stem, options FROM questions WHERE fingerprint IS NULL OR fingerprint=''")
+        rows = cur.fetchall()
+
+        for qid, kind, stem, options_json in rows:
+            try:
+                opts = json.loads(options_json) if options_json else None
+            except Exception:
+                opts = None
+            fp = make_question_fingerprint(str(kind), str(stem), opts if isinstance(opts, list) else None)
+            cur.execute("UPDATE questions SET fingerprint=? WHERE id=?", (fp, qid))
+            updated += 1
+
+        con.commit()
+        return {"updated": updated}
+    finally:
+        con.close()
+
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    """Otwiera połączenie SQLite z sensownymi ustawieniami współbieżności."""
     con = sqlite3.connect(db_path, timeout=30.0)
+    con.execute("PRAGMA foreign_keys=ON;")  # <--- DODAJ TO
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA busy_timeout=30000;")
     return con
+
 
 def init_db(db_path: str):
     """Tworzy/aktualizuje schemat DB.
@@ -23,6 +131,12 @@ def init_db(db_path: str):
         if "sha256" not in cols:
             cur.execute("ALTER TABLE sources ADD COLUMN sha256 TEXT")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_sha256 ON sources(sha256)")
+                # pytania: fingerprint (anty-duplikaty)
+        cur.execute("PRAGMA table_info(questions)")
+        qcols = {row[1] for row in cur.fetchall()}
+        if "fingerprint" not in qcols:
+            cur.execute("ALTER TABLE questions ADD COLUMN fingerprint TEXT")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_fingerprint ON questions(fingerprint)")
 
         con.commit()
     finally:
@@ -70,13 +184,15 @@ def backfill_sources_sha256(src_dir: str, db_path: str) -> dict:
     finally:
         con.close()
 
-def save_question_with_citations(qid: str, q: dict, db_path: str):
+def save_question_with_citations(qid: str, q: dict, db_path: str, fingerprint: str | None = None):
+    fp = fingerprint or make_question_fingerprint(q["kind"], q["stem"], q.get("options"))
+
     con = _connect(db_path)
     try:
         cur = con.cursor()
         cur.execute(
-            """INSERT INTO questions(id,kind,stem,options,answer,explanation,metadata,created_at)
-               VALUES(?,?,?,?,?,?,?,datetime('now'))""",
+            """INSERT INTO questions(id,kind,stem,options,answer,explanation,metadata,fingerprint,created_at)
+               VALUES(?,?,?,?,?,?,?,?,datetime('now'))""",
             (
                 qid,
                 q["kind"],
@@ -85,6 +201,7 @@ def save_question_with_citations(qid: str, q: dict, db_path: str):
                 q["answer"],
                 q["explanation"],
                 json.dumps(q["metadata"]),
+                fp,
             ),
         )
         for c in q["citations"]:
@@ -96,6 +213,7 @@ def save_question_with_citations(qid: str, q: dict, db_path: str):
         con.commit()
     finally:
         con.close()
+
 
 def insert_rating(qid: str, score: int, feedback: str | None, db_path: str):
     score = max(1, min(10, score))

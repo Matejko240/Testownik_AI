@@ -12,10 +12,15 @@ from .rag.store import (
     insert_rating,
     get_source_id_by_sha256,
     backfill_sources_sha256,
+    backfill_questions_fingerprint,
+    get_question_id_by_fingerprint,
+    make_question_fingerprint,
+    list_recent_question_stems,
     list_sources,
     get_question,
-    list_questions,   
+    list_questions,
 )
+
 
 from .rag.ingest import ingest_files
 from .rag.search import rag_search
@@ -38,6 +43,8 @@ def _startup():
     init_db(settings.db_path)
     # ważne: żeby deduplikacja działała też dla starych uploadów
     backfill_sources_sha256(settings.src_dir, db_path=settings.db_path)
+    backfill_questions_fingerprint(db_path=settings.db_path)
+
 
 class SearchReq(BaseModel):
     query: str
@@ -137,27 +144,100 @@ def search(req: SearchReq):
 
 @app.post("/gen/yn")
 def gen_yn(req: GenReq):
-    ctx_all = rag_search(req.topic or "przegląd materiału", k=max(8, int(req.n) * 3), db_path=settings.db_path)
+    n = max(1, int(req.n))
+    # więcej kontekstu => większa szansa na unikalne pytania
+    ctx_all = rag_search(req.topic or "przegląd materiału", k=max(30, n * 12), db_path=settings.db_path)
+    random.shuffle(ctx_all)
+
+    recent_ban = list_recent_question_stems(settings.db_path, kind="YN", topic=req.topic, limit=40)
+
     items = []
-    for i in range(max(1, int(req.n))):
-        ctx = _pick_ctx(ctx_all, i, size=4)
-        q = gen_yes_no(ctx, topic=req.topic, difficulty=req.difficulty, provider=req.provider, variant=i+1)
-        qid = str(uuid.uuid4())
-        save_question_with_citations(qid, q, db_path=settings.db_path)
-        items.append({"question_id": qid, "question": q})
-    return items[0] if int(req.n) == 1 else {"items": items}
+    used_fps: set[str] = set()
+    used_stems: list[str] = []
+
+    for i in range(n):
+        added = False
+
+        for attempt in range(12):
+            ctx = _pick_ctx(ctx_all, i + attempt, size=4)
+
+            ban = (recent_ban + used_stems)[-40:]
+            q = gen_yes_no(ctx, topic=req.topic, difficulty=req.difficulty, provider=req.provider, variant=i + 1 + attempt)
+
+            fp = make_question_fingerprint(q.get("kind", "YN"), q.get("stem", ""), q.get("options"))
+
+            # duplikat w tym samym batchu
+            if fp in used_fps:
+                continue
+
+            # duplikat w bazie (wcześniej wygenerowane)
+            if get_question_id_by_fingerprint(fp, db_path=settings.db_path) is not None:
+                continue
+
+            qid = str(uuid.uuid4())
+            try:
+                save_question_with_citations(qid, q, db_path=settings.db_path, fingerprint=fp)
+            except Exception:
+                # np. wyścig / unique constraint — spróbuj jeszcze raz
+                continue
+
+            used_fps.add(fp)
+            used_stems.append(q.get("stem", ""))
+            items.append({"question_id": qid, "question": q})
+            added = True
+            break
+
+        if not added:
+            # brak możliwości wyprodukowania kolejnego unikalnego pytania w limicie prób
+            break
+
+    return items[0] if n == 1 else {"items": items}
 
 @app.post("/gen/mcq")
 def generate_mcq(req: GenReq):
-    ctx_all = rag_search(req.topic or "przegląd materiału", k=max(10, int(req.n) * 3), db_path=settings.db_path)
+    n = max(1, int(req.n))
+    ctx_all = rag_search(req.topic or "przegląd materiału", k=max(40, n * 12), db_path=settings.db_path)
+    random.shuffle(ctx_all)
+
+    recent_ban = list_recent_question_stems(settings.db_path, kind="MCQ", topic=req.topic, limit=40)
+
     items = []
-    for i in range(max(1, int(req.n))):
-        ctx = _pick_ctx(ctx_all, i, size=6)
-        q = gen_mcq(ctx, topic=req.topic, difficulty=req.difficulty, provider=req.provider, variant=i+1)
-        qid = str(uuid.uuid4())
-        save_question_with_citations(qid, q, db_path=settings.db_path)
-        items.append({"question_id": qid, "question": q})
-    return items[0] if int(req.n) == 1 else {"items": items}
+    used_fps: set[str] = set()
+    used_stems: list[str] = []
+
+    for i in range(n):
+        added = False
+
+        for attempt in range(12):
+            ctx = _pick_ctx(ctx_all, i + attempt, size=6)
+
+            ban = (recent_ban + used_stems)[-40:]
+            q = gen_mcq(ctx, topic=req.topic, difficulty=req.difficulty, provider=req.provider, variant=i + 1 + attempt)
+
+            fp = make_question_fingerprint(q.get("kind", "MCQ"), q.get("stem", ""), q.get("options"))
+
+            if fp in used_fps:
+                continue
+            if get_question_id_by_fingerprint(fp, db_path=settings.db_path) is not None:
+                continue
+
+            qid = str(uuid.uuid4())
+            try:
+                save_question_with_citations(qid, q, db_path=settings.db_path, fingerprint=fp)
+            except Exception:
+                continue
+
+            used_fps.add(fp)
+            used_stems.append(q.get("stem", ""))
+            items.append({"question_id": qid, "question": q})
+            added = True
+            break
+
+        if not added:
+            break
+
+    return items[0] if n == 1 else {"items": items}
+
 
 @app.post("/rate")
 def rate(req: RateReq):
