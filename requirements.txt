@@ -1,0 +1,14 @@
+fastapi[standard]
+uvicorn[standard]
+pypdf
+python-pptx
+docx2txt
+ebooklib
+numpy
+faiss-cpu
+sentence-transformers
+python-dotenv
+openai
+tensorflow
+tf-keras
+httpx==0.27.2
