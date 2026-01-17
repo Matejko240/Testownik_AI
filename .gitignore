@@ -9,7 +9,7 @@ build/
 
 # Project data (do not version)
 data/index/
-
+data/sources/
 *.db
 *.sqlite
 

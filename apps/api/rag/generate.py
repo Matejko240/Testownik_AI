@@ -478,7 +478,37 @@ def _normalize_options(opts: Any) -> list[str] | None:
         out.append(s)
     return out
 
+# --- BAN: meta-opcje typu "zgodne/sprzeczne z fragmentami" ---
+_GENERIC_META_OPTIONS_RAW = [
+    "Stwierdzenie zgodne z fragmentami",
+    "Stwierdzenie sprzeczne z fragmentami",
+    "Stwierdzenie niepowiązane z fragmentami",
+    "Stwierdzenie niewynikające wprost z fragmentów",
+]
 
+def _norm_opt(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[\"'„”]", "", s)
+    return s
+
+_GENERIC_META_SET = {_norm_opt(x) for x in _GENERIC_META_OPTIONS_RAW}
+
+def _is_generic_meta_mcq_options(opts: list[str] | None) -> bool:
+    if not isinstance(opts, list) or len(opts) != 4:
+        return False
+    s = {_norm_opt(o) for o in opts}
+    # dokładne dopasowanie zestawu (najczęstszy przypadek)
+    if s == _GENERIC_META_SET:
+        return True
+    # luźniejszy match (gdy LLM lekko pozmienia tekst)
+    hit = 0
+    for o in s:
+        if ("fragment" in o or "fragmentów" in o) and (
+            "zgodne" in o or "sprzeczne" in o or "niepowiązane" in o or "niewynikające" in o
+        ):
+            hit += 1
+    return hit >= 3
 def _validate_mcq_obj(obj: dict) -> tuple[bool, str]:
     if not isinstance(obj, dict):
         return False, "not a dict"
@@ -498,6 +528,8 @@ def _validate_mcq_obj(obj: dict) -> tuple[bool, str]:
         return False, "empty option"
     if len({o.lower() for o in opts}) != 4:
         return False, "options must be unique"
+    if _is_generic_meta_mcq_options(opts):
+        return False, "options too generic (meta-options like zgodne/sprzeczne are not allowed)"
 
     ans = _norm_answer_letter(obj.get("answer"))
     if ans not in {"a", "b", "c", "d"}:
@@ -634,6 +666,8 @@ Wymagania twarde:
 - answer ma być literą: "a"|"b"|"c"|"d",
 - nie używaj opcji typu „wszystkie powyższe”,
 - stem ma dotyczyć jednego konkretnego faktu/pojęcia z fragmentów (nie pytaj ogólnie).
+- NIE używaj opcji meta typu: „Stwierdzenie zgodne z fragmentami / sprzeczne / niepowiązane / niewynikające…”
+— każda opcja ma zawierać treść merytoryczną związaną z tematem.
 
 Zwróć TYLKO JSON:
 {{"stem":str,"options":[str,str,str,str],"answer":"a"|"b"|"c"|"d","explanation":str}}
@@ -692,7 +726,7 @@ Fragmenty:
                 + base_prompt
             )
 
-    # Fallback MCQ (offline / LLM failed) — spróbuj użyć sensownej linii z kontekstu (nie nagłówka)
+    # Fallback MCQ (offline / LLM failed) — nadal MCQ, ale merytoryczny (bez meta-opcji)
     best = ""
     for ln in (body.splitlines() if body else []):
         s = ln.strip()
@@ -702,22 +736,48 @@ Fragmenty:
 
     src = cites[0]["source"] if cites else "source"
     page = cites[0]["page"] if cites else 1
+
+    claim = best
+    m = re.match(r"^\[([^\|\]]+)\|p\.(\d+)\]\s*(.+)$", best)
+    if m:
+        src, page, claim = m.group(1), int(m.group(2)), m.group(3)
+
+    claim = re.sub(r"\s+", " ", (claim or "").strip())
+    if len(claim) > 180:
+        claim = claim[:180].rstrip() + "…"
+
     tag = f"[{src}|p.{page}]"
 
-    base = best if best else "Materiał dotyczy zagadnień z optymalizacji i algorytmów."
+    # Prosty, ale merytoryczny zestaw odpowiedzi: 1 prawdziwa (dosłowny sens z fragmentu) + 3 fałszywe
+    options = [
+        claim,
+        "W tym podejściu wykorzystuje się wyłącznie jeden algorytm (bez łączenia metod).",
+        "Algorytmy są uruchamiane równolegle (jednocześnie), a nie sekwencyjnie / na zmianę.",
+        "W materiale wskazano, że nie stosuje się żadnego kryterium STOP (działanie bez warunku zakończenia).",
+    ]
+
+    # Upewnij się, że 4 opcje są unikalne (na wypadek, gdyby claim był „zbyt podobny”)
+    seen = set()
+    uniq = []
+    for o in options:
+        key = _norm_opt(o)
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(o)
+        if len(uniq) == 4:
+            break
+
+    # jeśli przez ekstremalny przypadek brak 4 unikalnych, dobij neutralnymi (ale nadal treściowymi)
+    while len(uniq) < 4:
+        uniq.append(f"Opis dotyczy innej klasy metod niż ta przedstawiona w cytowanym fragmencie ({len(uniq)+1}).")
 
     return {
         "kind": "MCQ",
-        "stem": f"Które stwierdzenie najlepiej wynika z przytoczonych fragmentów?\n{base}",
-        "options": [
-            "Stwierdzenie zgodne z fragmentami",
-            "Stwierdzenie sprzeczne z fragmentami",
-            "Stwierdzenie niepowiązane z fragmentami",
-            "Stwierdzenie niewynikające wprost z fragmentów",
-        ],
+        "stem": "Które z poniższych stwierdzeń jest zgodne z cytowanym fragmentem?",
+        "options": uniq,
         "answer": "a",
-        "explanation": f"{tag} Opcja a) jest zgodna z przytoczonym fragmentem.",
+        "explanation": f"{tag} Poprawna odpowiedź wynika bezpośrednio z przytoczonego fragmentu.",
         "metadata": _meta(topic, difficulty),
-        "citations": cites[:2],
+        "citations": [{"source": src, "page": int(page), "quote": claim}],
         "debug": {"fallback_reason": last_reason},
     }
