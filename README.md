@@ -1,37 +1,70 @@
-# Testownik AI —  (FastAPI + RAG)
+# Testownik AI — backend (FastAPI + RAG)
 
-Backend do aplikacji „Testownik AI”.  
-Z wgranych materiałów **PDF / PPTX / DOCX / EPUB** buduje bazę wiedzy, a następnie generuje:
+Backend do aplikacji „Testownik AI”. Z wgranych materiałów **PDF / PPTX / DOCX / EPUB** buduje bazę wiedzy (RAG), a następnie generuje:
 
-- pytania **TAK/NIE**,
-- pytania **ABCD (MCQ)**
+- pytania **TAK/NIE** (YN),
+- pytania **ABCD (MCQ)**.
 
-z **poprawną odpowiedzią, wyjaśnieniem** oraz **cytowaniem źródeł** (plik + strona/slajd + krótki cytat).
+Wynik to JSON z **poprawną odpowiedzią**, **krótkim wyjaśnieniem** oraz **cytowaniem źródeł** (plik + strona/slajd + cytat).
 
 ---
-## 0. zrób .env
-przyklad:
+
+## 0) Konfiguracja (.env)
+
+Utwórz plik `.env` (przykład):
+
+```env
 APP_HOST=127.0.0.1
 APP_PORT=8000
+
+# Embedding model (SentenceTransformers)
 EMB_MODEL=sentence-transformers/all-MiniLM-L6-v2
-LLM_PROVIDER=ollama            # openai|ollama|none
+
+# LLM: openai|ollama|none
+LLM_PROVIDER=ollama
+
+# OpenAI
 OPENAI_API_KEY=sk-...
+
+# Ollama
 OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:4b
+```
 
+---
 
-## 1. Instalacja i uruchomienie
+## 1) Instalacja i uruchomienie
 
-Wymagania: Python 3.11+.
+Wymagania: **Python 3.11+**.
 
 ```bash
 pip install -r requirements.txt
+```
+
+Start w trybie dev (FastAPI CLI):
+
+```bash
 fastapi dev apps/api/main.py
 ```
-Domyślne adresy:
+
+Alternatywnie (Uvicorn, jeśli uruchamiasz jako moduł):
+
+```bash
+uvicorn apps.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Domyślnie:
 - API: http://127.0.0.1:8000
 - Swagger UI: http://127.0.0.1:8000/docs
 
-## 2. Format odpowiedzi (przykład)
+> Uwaga: przy starcie wykonywany jest `init_db(...)` oraz backfill hashy źródeł i fingerprintów pytań (żeby działała deduplikacja).
+
+---
+
+## 2) Format odpowiedzi
+
+### 2.1 Pojedyncze pytanie (MCQ) — przykład
+
 ```json
 {
   "question_id": "a8c856ef-3aae-4251-90df-e3aa58ca84d8",
@@ -42,94 +75,135 @@ Domyślne adresy:
     "answer": "a",
     "explanation": "Uzasadnienie oparte na cytowanych fragmentach.",
     "metadata": {
-      "topic": "general",
+      "topic": "algorytmy",
       "difficulty": "medium",
-      "timestamp": "2025-10-25T13:04:31.001193Z"
+      "timestamp": "2026-01-17T19:12:00.000000Z"
     },
     "citations": [
       {
-        "source": "SP-W03.pdf",
+        "source": "Wykład_OR.pdf",
         "page": 48,
-        "quote": "Analogicznie wygląda przykład w MicroPython"
+        "quote": "Krótki cytat z materiału..."
       }
     ]
   }
 }
 ```
-Dla pytań TAK/NIE (kind: "YN") w polu options jest null, a answer przyjmuje wartości "TAK" lub "NIE"
 
-## 3. Endpointy (skrót)
+### 2.2 TAK/NIE (YN)
 
-| Method | Path       | Body (JSON / multipart)                                       | Opis                                                 |
-| ------ | ---------- | ------------------------------------------------------------- | ---------------------------------------------------- |
-| POST   | `/upload`  | `files=@plik` (multipart, można wysłać wiele plików)          | Indeksacja materiałów **PDF/PPTX/DOCX/EPUB**.        |
-| POST   | `/search`  | `{ "query": "...", "k": 8 }`                                  | Wyszukiwanie fragmentów (RAG) z cytowaniami.         |
-| POST   | `/gen/yn`  | `{ "topic": "...", "difficulty": "easy\|medium\|hard" }`      | Pytanie **TAK/NIE** + wyjaśnienie + cytowania.       |
-| POST   | `/gen/mcq` | `{ "topic": "...", "difficulty": "easy\|medium\|hard" }`      | Pytanie **ABCD** + poprawna odpowiedź + wyjaśnienie. |
-| POST   | `/rate`    | `{ "question_id": "...", "score": 1..10, "feedback": "..." }` | Ocena jakości pytania (uczenie się na feedbacku).    |
+Dla pytań **TAK/NIE** (kind: `"YN"`):
+- `options` jest `null`,
+- `answer` przyjmuje wartości `"TAK"` lub `"NIE"`.
 
-Typowe użycie frontend:
--  Wysyła materiały przez /upload.
-- Woła /gen/mcq lub /gen/yn dla wybranego tematu.
-- Wyświetla wygenerowane pytanie + wyjaśnienie + źródła.
-- Po rozwiązaniu pytania woła /rate, żeby zapisać ocenę.
-## 4. Konfiguracja LLM (ENV)
+### 2.3 Batch (n > 1)
 
-Backend może działać:
-- w trybie **offline** (`LLM_PROVIDER=none`) – pytania generowane prostym fallbackiem,
-- z modelem **OpenAI** (`LLM_PROVIDER=openai`, `OPENAI_API_KEY=...`),
-- z lokalnym **Ollama** (`LLM_PROVIDER=ollama`, `OLLAMA_BASE_URL=...`).
+Jeśli w request ustawisz `n > 1`, endpoint `/gen/yn` oraz `/gen/mcq` zwraca:
 
-Frontend nie musi tego konfigurować – ważne jest tylko, że:
-- jeśli LLM działa, pytania są „mądre” i oparte na kontekście,
-- jeśli nie, backend nadal zwróci poprawny JSON, tylko prostsze pytania.
+```json
+{ "items": [ {"question_id": "...", "question": {"kind": "..."} } ] }
+```
 
-## 5. Struktura danych (lokalnie)
+---
+
+## 3) Endpointy
+
+| Method | Path | Body / Query | Opis |
+|---|---|---|---|
+| POST | `/upload` | `files=@plik` (multipart, możesz wysłać wiele plików) | Ingest: indeksacja PDF/PPTX/DOCX/EPUB do bazy wiedzy. Deduplikacja po SHA256 (w request i w bazie). |
+| GET | `/providers` | — | Informacja dla UI: `default`, `available`, `configured` (czy są klucze/URL). |
+| POST | `/search` | `{ "query": "...", "k": 8 }` | RAG: zwraca top-k chunków z cytowaniami i score. |
+| POST | `/gen/yn` | `{ "topic": "...", "difficulty": "easy|medium|hard", "n": 10, "provider": "default|none|ollama|openai" }` | Generuje YN, zapisuje w DB, dba o unikalność (fingerprint). |
+| POST | `/gen/mcq` | `{ "topic": "...", "difficulty": "easy|medium|hard", "n": 10, "provider": "default|none|ollama|openai" }` | Generuje MCQ, zapisuje w DB, dba o unikalność (fingerprint). |
+| POST | `/rate` | `{ "question_id": "...", "score": 1..10, "feedback": "..." }` | Zapis oceny pytania (feedback loop). |
+| GET | `/sources` | `limit, offset` | Lista źródeł (z paginacją). |
+| DELETE | `/sources` | — | Czyści źródła: usuwa pliki + resetuje bazę. |
+| GET | `/questions` | `limit, offset, kind?, topic?, with_citations?, with_quality?` | Lista zapisanych pytań. `topic` filtruje po `metadata.topic`. |
+| GET | `/questions/{question_id}` | `with_quality?` | Jedno pytanie po ID. |
+
+---
+
+## 4) Przykładowe użycie (curl)
+
+### 4.1 Upload (wiele plików)
+
+```bash
+curl -X POST "http://127.0.0.1:8000/upload" \
+  -H "accept: application/json" \
+  -F "files=@Wykład_OR.pdf" \
+  -F "files=@AI_Testownik.pdf"
+```
+
+### 4.2 Search (RAG)
+
+```bash
+curl -X POST "http://127.0.0.1:8000/search" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"metaheurystyki","k":8}'
+```
+
+### 4.3 Generowanie 10 MCQ
+
+```bash
+curl -X POST "http://127.0.0.1:8000/gen/mcq" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{"topic":"metaheurystyki","difficulty":"medium","n":10,"provider":"default"}'
+```
+
+### 4.4 Lista pytań po topicu
+
+```bash
+curl "http://127.0.0.1:8000/questions?limit=50&offset=0&topic=metaheurystyki&with_citations=true&with_quality=true"
+```
+
+---
+
+## 5) Struktura danych (lokalnie)
+
+Domyślne ścieżki (patrz `settings.py`):
+
 ```
 data/
   sources/   # wgrane materiały (PDF, PPTX, DOCX, EPUB)
-  index/     # plik bazy SQLite + embeddingi
+  index/     # SQLite + pliki indeksu
 ```
-- Tabela sources – informacje o plikach (nazwa, typ MIME, liczba stron/slajdów).
-- Tabela chunks – tekst pocięty na fragmenty (chunki) + embeddingi.
-- Tabela questions – wygenerowane pytania, odpowiedzi, wyjaśnienia, metadane.
-- Tabela question_citations – powiązanie pytania z konkretnymi plikami/stronami.
-- Tabela ratings – oceny użytkowników.
-- Tabela chunk_weights – wagi chunków, wpływające na przyszłe wyszukiwanie (RAG).
-## 6. Przepływ danych (od PDF do pytania)
 
-### Skrót słowny
+Najważniejsze tabele w SQLite:
+- `sources` — pliki źródłowe + `sha256` do deduplikacji,
+- `chunks` — pocięty tekst + embeddingi,
+- `questions` — wygenerowane pytania + `fingerprint` do deduplikacji,
+- `question_citations` — powiązania pytanie↔(plik, strona, cytat),
+- `ratings` — oceny użytkowników,
+- `chunk_weights` — wagi chunków (feedback loop),
+- `question_quality` (VIEW) — agregat `avg_score` i `votes`.
 
-1. Upload materiału  
-   Frontend wysyła pliki na `/upload`. FastAPI zapisuje je w `data/sources/`.
+---
 
-2. Ingest (budowa bazy wiedzy)  
-   Funkcja `ingest_files(...)`:
-   - sprawdza typ pliku (`_detect_mime`),
-   - czyta tekst stron/slajdów (`_read_pdf/_read_pptx/_read_docx/_read_epub`),
-   - tnie tekst na chunki (`chunk_text`),
-   - liczy embeddingi dla każdego chunku (`embed_texts`),
-   - zapisuje wszystko w SQLite (`sources`, `chunks`).
+## 6) Wydajność (gdy generowanie jest wolne)
 
-3. RAG – wybór kontekstu  
-   Przy wywołaniu `/gen/mcq` lub `/gen/yn`:
-   - `rag_search(...)` wczytuje embeddingi z bazy (`_load`),
-   - embeduje treść zapytania (`embed_query`),
-   - wybiera `top_k` najbardziej pasujących chunków
-     (z uwzględnieniem wag `chunk_weights`),
-   - składa kontekst w jeden tekst + listę cytatów (`_flatten_ctx`).
+Jeśli generujesz wiele pytań pod rząd, zwykle „wąskie gardła” to:
 
-4. Generowanie pytania (LLM)  
-   - `gen_mcq(...)` / `gen_yes_no(...)` budują prompt z kontekstem i poziomem trudności,  
-   - `ask_llm(...)` wysyła go do wybranego LLM; odpowiedź (JSON) parsujemy do `question_object`.
+1) **liczba wywołań LLM na pytanie** (retry + checki),
+2) **długość prompta** (za dużo kontekstu / za długie uzasadnienia),
+3) **RAG** (ładowanie embeddingów i zapytania do SQLite przy każdym żądaniu).
 
-5. Zapis i odpowiedź  
-   - `save_question_with_citations(...)` zapisuje pytanie i źródła w bazie,  
-   - endpoint zwraca JSON `{question_id, question}` do frontendu.
+Praktyczne kroki (od najbezpieczniejszych jakościowo):
 
-6. Ocena pytań (feedback loop)  
-   - `/rate` zapisuje oceny w `ratings`  
-   - aktualizuje `chunk_weights`, żeby kolejne pytania lepiej korzystały z materiałów.
+- **Cache RAG**: trzymanie embeddingów w RAM i odświeżanie cache po `/upload` (największy zysk bez wpływu na jakość).
+- **Krótsze odpowiedzi LLM**: w Ollamie obniż `num_predict` (np. 350–450) i ogranicz długość `explanation` w promptach.
+- **Mniej retry**: jeśli masz `n=10`, a retry jest wysokie, liczba requestów rośnie bardzo szybko.
+- **Mniej kontekstu**: zmniejszenie liczby chunków w `_pick_ctx(..., size=...)` przyspiesza, ale może pogorszyć „zakotwiczenie” pytania w źródłach.
+
+---
+
+## 7) Przepływ danych (od PDF do pytania)
+
+1. Upload materiału (`/upload`) → zapis do `data/sources/` + ingest do SQLite.
+2. RAG (`/search` / generowanie) → wybór `top_k` chunków + złożenie kontekstu i cytowań.
+3. Generowanie (`/gen/mcq` lub `/gen/yn`) → LLM zwraca JSON, backend zapisuje pytanie + cytowania.
+4. Oceny (`/rate`) → zapis do `ratings` (+ opcjonalna aktualizacja wag chunków).
 
 ```mermaid
 flowchart TB
