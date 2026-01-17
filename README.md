@@ -209,50 +209,51 @@ Praktyczne kroki (od najbezpieczniejszych jakościowo):
 flowchart TB
 
   %% --- Ingest ---
-  subgraph ING ["Etap A: Ingest materiałów"]
+  subgraph ING["Etap A: Ingest materiałów"]
     direction TB
-    U["Upload pliku PDF (frontend)<br/>Dane: plik PDF (binarny)"]
-    A1["Endpoint /upload (FastAPI)<br/>Dane: multipart/form-data z plikiem"]
-    A2["Zapis pliku na dysk (settings.src_dir)<br/>Dane: file_path (string)"]
-    A3["ingest_files(file_paths, database_path, index_directory, embedding_model_name)<br/>Wejście: lista ścieżek plików"]
-    A31["_detect_mime(file_path)<br/>Dane: file_path → mime_type (string)"]
-    A32["_read_pdf / _read_pptx / _read_docx / _read_epub<br/>Dane: lista (page_number, full_page_text)"]
-    A33["chunk_text(full_page_text)<br/>Dane: chunki (source_id, page_number, chunk_text, short_quote)"]
-    A34["embed_texts(list_of_chunk_texts)<br/>Dane: embeddingi (384D) → BLOB"]
-    A35["SQLite: INSERT INTO sources oraz chunks<br/>Dane: rekordy w bazie"]
+    U["Upload plików (frontend)<br/>Dane: PDF/PPTX/DOCX/EPUB (binarnie), wiele plików"]
+    A1["POST /upload (FastAPI)<br/>multipart/form-data files[]"]
+    A2["Zapis plików na dysk (settings.src_dir)<br/>+ deduplikacja po SHA256 (request + DB)"]
+    A3["ingest_files(paths, db_path, index_dir, emb_model)"]
+    A31["_detect_mime(path)<br/>ext -> mime"]
+    A32["_read_pdf/_read_pptx/_read_docx/_read_epub<br/>Wyjście: (page_number, full_text)"]
+    A33["chunk_text(full_text)<br/>max_chars=1100, overlap=200"]
+    A34["embed_texts(chunks)<br/>Wyjście: embeddingi (bytes/float32)"]
+    A35["SQLite INSERT sources + chunks<br/>Dane: source_id, page, text, quote, embedding, sha256"]
 
     U --> A1 --> A2 --> A3 --> A31 --> A32 --> A33 --> A34 --> A35
   end
 
   %% --- RAG + LLM ---
-  subgraph GEN ["Etap B: Pytanie"]
+  subgraph GEN["Etap B: Generowanie pytań"]
     direction TB
-    B1["POST /gen/mcq lub /gen/yn (frontend)<br/>Dane: JSON {topic_text, difficulty_level}"]
-    B2["rag_search(question_text, top_k, database_path)<br/>Wyjście: lista kontekstów (chunk + score)"]
-    B21["_load(database_connection)<br/>Dane: embeddingi chunków + chunk_weights"]
-    B22["embed_query(question_text, embedding_model_name)<br/>Dane: query_embedding_vector (384D)"]
-    B23["similarity = matrix_of_embeddings * query_embedding_vector * (1 + chunk_weights)"]
-    B24["_flatten_ctx(context_list)<br/>Dane: context_text + citations_list"]
-    B3["gen_mcq(...) / gen_yes_no(... )<br/>Dane: prompt_text dla LLM"]
-    B31["ask_llm(prompt_text)<br/>Dane: odpowiedź LLM jako JSON (string)"]
-    B32["json.loads(...) + metadata<br/>Dane: question_object (dict)"]
-    B4["save_question_with_citations(question_id, question_object)<br/>Dane: zapis w questions + question_citations"]
-    B5["Odpowiedź do frontend<br/>Dane: JSON {question_id, question_object}"]
+    B1["POST /gen/mcq lub /gen/yn (frontend)<br/>JSON: {topic, difficulty, n, provider}"]
+    B2["rag_search(query = topic lub 'przegląd materiału', k=...)<br/>Wyjście: ctx_all (lista chunków + score)"]
+    B21["_load(DB)<br/>embeddingi chunków + LEFT JOIN chunk_weights"]
+    B22["embed_query(query)<br/>query_vector (384D)"]
+    B23["sims = (mat @ qv) * (1 + w)<br/>sort top-k (+ oversampling)"]
+    B25["_pick_ctx(ctx_all, i, size)<br/>podzbiór kontekstu dla pytania i-tego / próby"]
+    B3["gen_mcq(...) / gen_yes_no(... )<br/>Budowa prompta + walidacje/retry"]
+    B24["_flatten_ctx(ctx_subset)<br/>ctx_text (limit 8000) + citations_list"]
+    B31["ask_llm(prompt_text)<br/>LLM -> JSON string"]
+    B32["parse + metadata + citations<br/>question_object (dict)"]
+    B4["save_question_with_citations(...)+ fingerprint dedup<br/>questions + question_citations"]
+    B5["Odpowiedź do frontend<br/>{question_id, question} lub {items:[...]}"]
 
-    B1 --> B2 --> B21 --> B22 --> B23 --> B24 --> B3 --> B31 --> B32 --> B4 --> B5
+    B1 --> B2 --> B21 --> B22 --> B23 --> B25 --> B3 --> B24 --> B31 --> B32 --> B4 --> B5
   end
 
   %% --- Ocena ---
-  subgraph RATE ["Opcjonalnie: ocena jakości pytań"]
+  subgraph RATE["Opcjonalnie: ocena jakości pytań"]
     direction TB
-    C1["POST /rate (frontend)<br/>Dane: JSON {question_id, score_value, feedback_text}"]
-    C2["insert_rating(question_id, score_value, feedback_text)<br/>Dane: nowy rekord w ratings"]
-    C3["UPDATE chunk_weights na podstawie score_value<br/>Dane: zaktualizowane wagi chunków"]
+    C1["POST /rate (frontend)<br/>JSON: {question_id, score, feedback}"]
+    C2["insert_rating(...): INSERT ratings<br/>+ UPDATE chunk_weights dla chunków z cytowań (source_id,page)"]
 
-    C1 --> C2 --> C3
+    C1 --> C2
   end
 
   A35 --> B1
-  C3 --> B2
+  C2 --> B2
+
 
 ```
