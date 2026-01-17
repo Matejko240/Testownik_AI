@@ -216,29 +216,69 @@ def save_question_with_citations(qid: str, q: dict, db_path: str, fingerprint: s
 
 
 def insert_rating(qid: str, score: int, feedback: str | None, db_path: str):
-    score = max(1, min(10, score))
+    score = max(1, min(10, int(score)))
+
     con = _connect(db_path)
     try:
         cur = con.cursor()
+
+        # 1) zapisz rating
         cur.execute(
             """INSERT INTO ratings(question_id,score,feedback,created_at)
                VALUES(?,?,?,datetime('now'))""",
             (qid, score, feedback),
         )
-        delta = 0.05 if score >= 8 else (-0.05 if score <= 3 else 0.0)
-        if abs(delta) > 0:
-            cur.execute(
-                """UPDATE chunk_weights SET weight=weight+?
-                   WHERE chunk_id IN (
-                      SELECT c.id FROM chunks c
-                      JOIN question_citations qc ON qc.source_id=c.source_id
-                      JOIN questions q ON q.id=qc.question_id
-                      WHERE q.id=?)""",
-                (delta, qid),
-            )
+
+        # 2) delta (ciągła, „czuć” efekt)
+        # 10 -> +0.27, 1 -> -0.27, 6 -> ~+0.03
+        delta = (score - 5.5) * 0.06
+        if abs(delta) < 1e-9:
+            con.commit()
+            return
+
+        # 3) znajdź chunki z tych samych (source_id, page) co cytowania pytania
+        cur.execute(
+            """
+            SELECT DISTINCT c.id
+            FROM chunks c
+            JOIN question_citations qc
+              ON qc.question_id = ?
+             AND qc.source_id = c.source_id
+             AND qc.page = c.page
+            """,
+            (qid,),
+        )
+        chunk_ids = [int(r[0]) for r in cur.fetchall()]
+        if not chunk_ids:
+            con.commit()
+            return
+
+        # 4) upewnij się, że chunk_weights ma rekordy (inaczej UPDATE nic nie zmieni)
+        cur.executemany(
+            "INSERT OR IGNORE INTO chunk_weights(chunk_id, weight) VALUES(?, 0.0)",
+            [(cid,) for cid in chunk_ids],
+        )
+
+        # 5) update z clampem (żeby (1+w) nie spadło do zera/negatywu i nie wystrzeliło w kosmos)
+        # w ∈ [-0.75, +1.50] => mnożnik (1+w) ∈ [0.25, 2.50]
+        placeholders = ",".join(["?"] * len(chunk_ids))
+        cur.execute(
+            f"""
+            UPDATE chunk_weights
+            SET weight = CASE
+              WHEN weight + ? > 1.50 THEN 1.50
+              WHEN weight + ? < -0.75 THEN -0.75
+              ELSE weight + ?
+            END
+            WHERE chunk_id IN ({placeholders})
+            """,
+            (delta, delta, delta, *chunk_ids),
+        )
+
         con.commit()
     finally:
         con.close()
+
 def list_sources(db_path: str, limit: int = 1000, offset: int = 0) -> dict:
     """Zwraca listę źródeł z DB (z paginacją) + total."""
     limit = max(1, min(int(limit), 5000))

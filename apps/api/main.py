@@ -162,7 +162,13 @@ def gen_yn(req: GenReq):
             ctx = _pick_ctx(ctx_all, i + attempt, size=4)
 
             ban = (recent_ban + used_stems)[-40:]
-            q = gen_yes_no(ctx, topic=req.topic, difficulty=req.difficulty, provider=req.provider, variant=i + 1 + attempt)
+            q = gen_mcq(ctx, topic=req.topic, difficulty=req.difficulty, provider=req.provider, variant=i + 1 + attempt)
+
+            # Jeśli generator wpadł w fallback (debug.fallback_reason), to nie zapisujmy takiego pytania.
+            # Lepiej zwrócić mniej pytań niż utrwalać bełt typu „zgodne z cytowanym fragmentem”.
+            if req.provider != "none" and isinstance(q, dict) and isinstance(q.get("debug"), dict):
+                if q["debug"].get("fallback_reason"):
+                    continue
 
             fp = make_question_fingerprint(q.get("kind", "YN"), q.get("stem", ""), q.get("options"))
 

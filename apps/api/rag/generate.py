@@ -520,7 +520,8 @@ def _validate_mcq_obj(obj: dict) -> tuple[bool, str]:
     s0 = stem.strip().lower()
     if re.match(r"^(jakie\s+są|wymień|podaj)\b", s0):
         return False, "stem too broad (use one specific fact/definition)"
-
+    if "cytowanym fragment" in s0:
+        return False, "stem too meta (do not ask 'zgodne z cytowanym fragmentem' questions)"
     opts = _normalize_options(obj.get("options"))
     if not opts or len(opts) != 4:
         return False, "options must be list of 4 strings"
@@ -682,11 +683,14 @@ Fragmenty:
     prompt = base_prompt
     last_reason = "init"
 
-    for attempt in range(3):
+    # więcej prób = mniej wejść w fallback (a fallback MCQ wygląda słabo)
+    for attempt in range(5):
         llm = ask_llm(prompt, provider=provider)
         qobj = _extract_json(llm) if llm else None
         if isinstance(qobj, dict) and isinstance(qobj.get("explanation"), str):
             qobj["explanation"] = _ensure_expl_has_rationale(qobj["explanation"], cites)
+            # ujednolić tagi (0 tagów / >1 tagów to najczęstszy powód wejścia w fallback)
+            qobj["explanation"] = _force_single_expl_tag(qobj["explanation"], cites)
 
         ok = False
         reason = "no json"
