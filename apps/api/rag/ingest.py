@@ -6,7 +6,7 @@ import docx2txt
 from ebooklib import epub
 from .util import chunk_text
 from .emb import embed_texts
-from .store import _connect
+from .store import _connect, _sha256_file, get_source_id_by_sha256
 
 def _detect_mime(path:str)->str:
     ext = Path(path).suffix.lower()
@@ -52,10 +52,17 @@ def ingest_files(paths:list[str], db_path:str, index_dir:str, emb_model:str):
             if not reader:
                 continue
             pages = list(reader(p))
+            sha = _sha256_file(p)
+            existing = get_source_id_by_sha256(sha, db_path)
+            if existing:
+                stats.append({"file": os.path.basename(p), "skipped": True, "source_id": existing})
+                continue
+
             cur.execute(
-                "INSERT INTO sources(filename,mime,pages,imported_at) VALUES(?,?,?,datetime('now'))",
-                (os.path.basename(p), mime, len(pages)),
+            "INSERT INTO sources(filename,mime,pages,sha256,imported_at) VALUES(?,?,?,?,datetime('now'))",
+            (os.path.basename(p), mime, len(pages), sha),
             )
+            
             sid = cur.lastrowid
             chunks, payload = [], []
             for page, full in pages:

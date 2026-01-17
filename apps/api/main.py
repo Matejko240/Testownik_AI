@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os, uuid, json, hashlib
@@ -12,7 +12,9 @@ from .rag.store import (
     insert_rating,
     get_source_id_by_sha256,
     backfill_sources_sha256,
-    list_sources,   
+    list_sources,
+    get_question,
+    list_questions,   
 )
 
 from .rag.ingest import ingest_files
@@ -161,3 +163,38 @@ def generate_mcq(req: GenReq):
 def rate(req: RateReq):
     insert_rating(req.question_id, req.score, req.feedback, db_path=settings.db_path)
     return {"ok": True}
+@app.get("/questions")
+def questions(
+    limit: int = 100,
+    offset: int = 0,
+    kind: str | None = None,
+    topic: str | None = None,          # <-- NOWE
+    with_citations: bool = True,
+    with_quality: bool = True,
+):
+    """Lista zapisanych pytań (z paginacją).
+
+    Parametry:
+      - kind: "YN" | "MCQ" | None
+      - topic: filtr po metadata.topic (np. "algorytmy")
+      - with_citations: czy dołączać cytowania
+      - with_quality: czy dołączać avg_score/votes (view question_quality)
+    """
+    return list_questions(
+        settings.db_path,
+        limit=limit,
+        offset=offset,
+        kind=kind,
+        topic=topic,                     # <-- NOWE
+        with_citations=with_citations,
+        with_quality=with_quality,
+    )
+
+
+@app.get("/questions/{question_id}")
+def question(question_id: str, with_quality: bool = True):
+    """Jedno pytanie po ID (np. do ponownego wyświetlenia/rate)."""
+    q = get_question(question_id, db_path=settings.db_path, with_quality=with_quality)
+    if not q:
+        raise HTTPException(status_code=404, detail="question_not_found")
+    return q

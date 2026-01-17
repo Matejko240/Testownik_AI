@@ -14,7 +14,11 @@ from .llm import ask_llm
 _HEADER_PATTERNS = [
     re.compile(r"\b\d+\s*/\s*\d+\b"),      # "82/157"
     re.compile(r"\b\d{4}\s*/\s*\d{4}\b"),  # "2025/2026"
+    re.compile(r"\bA\.\s*Wielgus\b", re.IGNORECASE),
+    re.compile(r"\bWykład\b", re.IGNORECASE),
+    re.compile(r"https?://", re.IGNORECASE),
 ]
+
 
 _TAG_RX = re.compile(r"\[[^\|\]]+\|p\.\d+\]")  # [File.pdf|p.123]
 
@@ -104,6 +108,30 @@ def _meta(topic: str | None, diff: str | None) -> dict:
 def _count_expl_tags(expl: str | None) -> int:
     return len(_TAG_RX.findall(expl or ""))
 
+def _strip_tags(text: str | None) -> str:
+    return _TAG_RX.sub("", (text or "")).strip()
+
+def _ensure_expl_has_rationale(expl: str, cites: list[dict]) -> str:
+    """
+    Jeśli explanation to tylko tag, dopisz krótki cytat/snippet z citations.
+    """
+    m = re.search(r"\[([^\|\]]+)\|p\.(\d+)\]", expl or "")
+    if not m:
+        return expl
+    src, page = m.group(1), int(m.group(2))
+
+    rest = _strip_tags(expl)
+    if rest:
+        return expl.strip()
+
+    for c in cites:
+        if c.get("source") == src and int(c.get("page")) == page:
+            quote = (c.get("quote") or "").strip()
+            if quote:
+                return f"[{src}|p.{page}] {quote}"
+            break
+
+    return expl.strip()
 
 def _filter_citations_by_expl(expl: str, cites: list[dict]) -> list[dict]:
     """
@@ -208,7 +236,50 @@ def _validate_yn_obj(obj: dict) -> tuple[bool, str]:
         return False, "missing explanation"
     if _count_expl_tags(expl) != 1:
         return False, "explanation must contain exactly one [source|p.N] tag"
+
+    # NOWE: explanation ma mieć też uzasadnienie (nie tylko tag)
+    rationale = _strip_tags(expl)
+    if len(rationale) < 12:
+        return False, "explanation too short (needs rationale text after tag)"
+
     return True, "ok"
+
+def _semantic_check_yn(body: str, stem: str, provider: str | None) -> tuple[bool, str | None]:
+    """
+    Z fragmentów oceń, czy zdanie (stem) jest prawdziwe.
+    Zwraca (ok, answer_from_checker) gdzie answer_from_checker to "TAK"/"NIE" lub None.
+    """
+    if provider in (None, "none"):
+        return True, None
+
+    prompt = f"""Użyj WYŁĄCZNIE fragmentów poniżej.
+Oceń, jaka odpowiedź (TAK/NIE) jest poprawna na to pytanie.
+Jeśli nie wynika jednoznacznie z fragmentów, odpowiedz "NIE".
+Zwróć TYLKO JSON: {{"answer":"TAK"|"NIE"}}.
+
+Pytanie TAK/NIE:
+{stem}
+
+Fragmenty:
+{body}
+""".strip()
+
+    resp = ask_llm(prompt, provider=provider)
+    if not resp:
+        return True, None
+
+    obj = _extract_json(resp)
+    if isinstance(obj, dict) and obj.get("answer") in {"TAK", "NIE"}:
+        return True, obj["answer"]
+
+    # fallback: spróbuj wyciągnąć TAK/NIE z tekstu
+    txt = resp.upper()
+    if "TAK" in txt and "NIE" not in txt:
+        return True, "TAK"
+    if "NIE" in txt and "TAK" not in txt:
+        return True, "NIE"
+
+    return False, None
 
 
 def gen_yes_no(ctx, topic=None, difficulty="medium", provider: str | None = None, variant: int = 1):
@@ -216,7 +287,13 @@ def gen_yes_no(ctx, topic=None, difficulty="medium", provider: str | None = None
 
     base_prompt = f"""Użyj WYŁĄCZNIE fragmentów poniżej i wygeneruj JEDNO pytanie TAK/NIE (wariant {variant}).
 Zwróć TYLKO JSON: {{"stem":str,"answer":"TAK"|"NIE","explanation":str}}.
-Wymóg: w "explanation" MUSI być dokładnie jeden tag w formacie [nazwa_pliku|p.N] z poniższych fragmentów.
+
+Wymagania twarde:
+- "answer" to dokładnie "TAK" lub "NIE",
+- "explanation" MUSI mieć dokładnie jeden tag [nazwa_pliku|p.N] z fragmentów,
+- po tagu MUSI być krótkie uzasadnienie (min 1 zdanie), dlaczego TAK/NIE,
+- uzasadnienie ma wynikać z przytoczonych fragmentów, bez zgadywania.
+
 Bez komentarzy, bez markdown, bez dodatkowego tekstu.
 
 Fragmenty:
@@ -226,9 +303,12 @@ Fragmenty:
     prompt = base_prompt
     last_reason = "init"
 
-    for attempt in range(2):
+    for attempt in range(3):
         llm = ask_llm(prompt, provider=provider)
         qobj = _extract_json(llm) if llm else None
+        if isinstance(qobj, dict) and isinstance(qobj.get("explanation"), str):
+            # jeśli model dał tylko tag, dolep snippet z kontekstu (żeby walidacja przeszła)
+            qobj["explanation"] = _ensure_expl_has_rationale(qobj["explanation"], cites)
 
         ok = False
         reason = "no json"
@@ -236,29 +316,92 @@ Fragmenty:
             ok, reason = _validate_yn_obj(qobj)
 
         if ok:
+            # semantic check: czy odpowiedź TAK/NIE wynika z fragmentów?
+            sem_ok, sem_ans = _semantic_check_yn(body, qobj.get("stem", ""), provider=provider)
+            if not sem_ok:
+                ok = False
+                reason = "semantic_check_parse_failed"
+            elif sem_ans in {"TAK", "NIE"} and sem_ans != qobj.get("answer"):
+                # zamiast wywalać pytanie: dopasuj answer do checkera i ustaw spójne uzasadnienie
+                qobj["answer"] = sem_ans
+
+                m = re.search(r"(\[[^\|\]]+\|p\.\d+\])", qobj.get("explanation", "") or "")
+                tag = m.group(1) if m else ""
+
+                if sem_ans == "TAK":
+                    expl_rest = _strip_tags(qobj.get("explanation", ""))
+                    if len(expl_rest) < 12:
+                        expl_rest = "Zdanie wynika wprost z przytoczonego fragmentu."
+                    qobj["explanation"] = f"{tag} {expl_rest}".strip()
+                else:
+                    qobj["explanation"] = (
+                        f"{tag} W przytoczonym fragmencie nie ma jednoznacznego potwierdzenia tego zdania, "
+                        "więc nie wynika ono wprost z materiału."
+                    ).strip()
+
+                ok = True
+                reason = "ok_after_semantic_alignment"
+
+
+        if ok:
             qobj["kind"] = "YN"
             qobj["metadata"] = _meta(topic, difficulty)
+
+            # citations tylko dla taga w explanation
             qobj["citations"] = _filter_citations_by_expl(qobj.get("explanation", ""), cites)
-            return qobj
+
+            # jeśli explanation to prawie sam tag -> dopisz snippet
+            qobj["explanation"] = _ensure_expl_has_rationale(qobj.get("explanation", ""), qobj["citations"])
+
+            # po dopisaniu jeszcze raz sprawdź minimalną jakość (żeby nie wrócił sam tag)
+            ok2, r2 = _validate_yn_obj(qobj)
+            if ok2:
+                return qobj
+
+            ok = False
+            reason = f"postprocess_validate_failed: {r2}"
 
         last_reason = reason
+
         prompt = (
             "NAPRAW OUTPUT. Zwróć WYŁĄCZNIE poprawny JSON. "
             f"Problem: {reason}. "
-            "Pamiętaj: answer=TAK/NIE, explanation zawiera dokładnie jeden tag [source|p.N].\n\n"
+            'Pamiętaj: answer="TAK"/"NIE", explanation ma dokładnie jeden tag [source|p.N] '
+            "i po tagu min 1 zdanie uzasadnienia.\n\n"
             + base_prompt
         )
 
-    # Fallback (offline / LLM failed)
-    first = (body.splitlines()[0] if body else "").strip()
-    stem = f"Czy poniższe stwierdzenie wynika z materiału?\n{first}" if first else "Czy poniższe stwierdzenie wynika z materiału?"
+    # Fallback (offline / LLM failed) — spróbuj użyć sensownej linii z kontekstu (nie nagłówka)
+    best = ""
+    for ln in (body.splitlines() if body else []):
+        s = ln.strip()
+        if s and not _looks_like_header(s) and len(s) > 40:
+            best = s
+            break
+
+    src = cites[0]["source"] if cites else "source"
+    page = cites[0]["page"] if cites else 1
+    quote = cites[0]["quote"] if cites else (best[:180] if best else "Fragment materiału.")
+    tag = f"[{src}|p.{page}]"
+
+    claim = best
+    if not claim:
+        claim = quote if isinstance(quote, str) and quote.strip() else "podane stwierdzenie"
+
+    m = re.match(r"^\[([^\|\]]+)\|p\.(\d+)\]\s*(.+)$", best)
+    if m:
+        src, page, claim = m.group(1), int(m.group(2)), m.group(3)
+        tag = f"[{src}|p.{page}]"
+        quote = claim[:180] + ("…" if len(claim) > 180 else "")
+
+    stem = f"Czy zgodnie z materiałem: „{claim}”?"
     return {
         "kind": "YN",
         "stem": stem,
         "answer": "TAK",
-        "explanation": "Na podstawie przytoczonych fragmentów.",
+        "explanation": f"{tag} To zdanie jest przytoczone w cytowanym fragmencie.",
         "metadata": _meta(topic, difficulty),
-        "citations": cites[:2],
+        "citations": [{"source": src, "page": int(page), "quote": quote}],
         "debug": {"fallback_reason": last_reason},
     }
 
@@ -297,6 +440,10 @@ def _validate_mcq_obj(obj: dict) -> tuple[bool, str]:
     stem = obj.get("stem")
     if not isinstance(stem, str) or not stem.strip():
         return False, "missing stem"
+    # zbyt ogólne/“wypisz” pytania robią wieloznaczność (np. "Jakie są ...?")
+    s0 = stem.strip().lower()
+    if re.match(r"^(jakie\s+są|wymień|podaj)\b", s0):
+        return False, "stem too broad (use one specific fact/definition)"
 
     opts = _normalize_options(obj.get("options"))
     if not opts or len(opts) != 4:
@@ -316,6 +463,9 @@ def _validate_mcq_obj(obj: dict) -> tuple[bool, str]:
 
     if _count_expl_tags(expl) != 1:
         return False, "explanation must contain exactly one [source|p.N] tag"
+    rationale = _strip_tags(expl)
+    if len(rationale) < 12:
+        return False, "explanation too short (needs rationale text after tag)"
 
     # nadpisz znormalizowane wartości (żeby reszta kodu korzystała z czystych opcji)
     obj["options"] = opts
@@ -452,6 +602,8 @@ Fragmenty:
     for attempt in range(3):
         llm = ask_llm(prompt, provider=provider)
         qobj = _extract_json(llm) if llm else None
+        if isinstance(qobj, dict) and isinstance(qobj.get("explanation"), str):
+            qobj["explanation"] = _ensure_expl_has_rationale(qobj["explanation"], cites)
 
         ok = False
         reason = "no json"
@@ -469,7 +621,9 @@ Fragmenty:
             qobj["kind"] = "MCQ"
             qobj["metadata"] = _meta(topic, difficulty)
             qobj["citations"] = _filter_citations_by_expl(qobj.get("explanation", ""), cites)
+            qobj["explanation"] = _ensure_expl_has_rationale(qobj.get("explanation", ""), qobj["citations"])
             return qobj
+
 
         last_reason = reason
 
@@ -489,9 +643,19 @@ Fragmenty:
                 + base_prompt
             )
 
-    # Fallback MCQ (offline / LLM failed)
-    first_line = (body.splitlines()[0] if body else "").strip()
-    base = first_line if first_line else "Materiał dotyczy zagadnień z optymalizacji i algorytmów."
+    # Fallback MCQ (offline / LLM failed) — spróbuj użyć sensownej linii z kontekstu (nie nagłówka)
+    best = ""
+    for ln in (body.splitlines() if body else []):
+        s = ln.strip()
+        if s and not _looks_like_header(s) and len(s) > 40:
+            best = s
+            break
+
+    src = cites[0]["source"] if cites else "source"
+    page = cites[0]["page"] if cites else 1
+    tag = f"[{src}|p.{page}]"
+
+    base = best if best else "Materiał dotyczy zagadnień z optymalizacji i algorytmów."
 
     return {
         "kind": "MCQ",
@@ -500,10 +664,10 @@ Fragmenty:
             "Stwierdzenie zgodne z fragmentami",
             "Stwierdzenie sprzeczne z fragmentami",
             "Stwierdzenie niepowiązane z fragmentami",
-            "Stwierdzenie zbyt ogólne, niewynikające wprost z fragmentów",
+            "Stwierdzenie niewynikające wprost z fragmentów",
         ],
         "answer": "a",
-        "explanation": "Odpowiedź a) jest zgodna z fragmentami.",
+        "explanation": f"{tag} Opcja a) jest zgodna z przytoczonym fragmentem.",
         "metadata": _meta(topic, difficulty),
         "citations": cites[:2],
         "debug": {"fallback_reason": last_reason},

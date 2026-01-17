@@ -168,3 +168,227 @@ def list_sources(db_path: str, limit: int = 1000, offset: int = 0) -> dict:
         return {"total": total, "items": items, "limit": limit, "offset": offset}
     finally:
         con.close()
+def _json_loads_or_none(val):
+    """Bezpiecznie parsuje pole JSON z SQLite (TEXT/JSON) do obiektu Pythona."""
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def get_question(question_id: str, db_path: str, with_quality: bool = True) -> dict | None:
+    """Zwraca jedno pytanie zapisane w DB + cytowania + opcjonalnie jakość (avg_score/votes)."""
+    if not question_id:
+        return None
+
+    con = _connect(db_path)
+    try:
+        cur = con.cursor()
+
+        if with_quality:
+            cur.execute(
+                """
+                SELECT
+                  q.id, q.kind, q.stem, q.options, q.answer, q.explanation, q.metadata, q.created_at,
+                  COALESCE(qq.avg_score, NULL) AS avg_score,
+                  COALESCE(qq.votes, 0) AS votes
+                FROM questions q
+                LEFT JOIN question_quality qq ON qq.question_id = q.id
+                WHERE q.id=?
+                LIMIT 1
+                """,
+                (question_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT q.id, q.kind, q.stem, q.options, q.answer, q.explanation, q.metadata, q.created_at,
+                       NULL AS avg_score, 0 AS votes
+                FROM questions q
+                WHERE q.id=?
+                LIMIT 1
+                """,
+                (question_id,),
+            )
+
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        qid, kind, stem, options, answer, explanation, metadata, created_at, avg_score, votes = row
+
+        # cytowania
+        cur.execute(
+            """
+            SELECT s.filename, qc.page, qc.quote
+            FROM question_citations qc
+            JOIN sources s ON s.id = qc.source_id
+            WHERE qc.question_id=?
+            ORDER BY s.filename ASC, qc.page ASC
+            """,
+            (qid,),
+        )
+        citations = [
+            {"source": r[0], "page": int(r[1]), "quote": r[2]} for r in cur.fetchall() if r and r[0]
+        ]
+
+        qobj = {
+            "kind": kind,
+            "stem": stem,
+            "options": _json_loads_or_none(options),
+            "answer": answer,
+            "explanation": explanation,
+            "metadata": _json_loads_or_none(metadata) or {},
+            "citations": citations,
+        }
+
+        out = {"question_id": qid, "question": qobj, "created_at": created_at}
+        if with_quality:
+            out["quality"] = {
+                "avg_score": (float(avg_score) if avg_score is not None else None),
+                "votes": int(votes or 0),
+            }
+        return out
+    finally:
+        con.close()
+
+
+def list_questions(
+    db_path: str,
+    limit: int = 100,
+    offset: int = 0,
+    kind: str | None = None,
+    topic: str | None = None,          # <-- NOWE
+    with_citations: bool = True,
+    with_quality: bool = True,
+) -> dict:
+    """Zwraca listę pytań zapisanych w DB (z paginacją)."""
+    limit = max(1, min(int(limit), 5000))
+    offset = max(0, int(offset))
+
+    k = (kind or "").strip().upper()
+    if k not in {"", "YN", "MCQ"}:
+        k = ""  # ignoruj niepoprawny filtr
+
+    t = (topic or "").strip().lower()
+
+    con = _connect(db_path)
+    try:
+        cur = con.cursor()
+
+        # --- budowa WHERE + params (bez limit/offset) ---
+        where = []
+        params = []
+
+        if k:
+            where.append("q.kind=?")
+            params.append(k)
+
+        # topic: preferuj JSON_EXTRACT, a jak SQLite nie ma JSON1 -> fallback LIKE
+        use_json_extract = bool(t)
+        if t:
+            where.append("LOWER(json_extract(q.metadata,'$.topic')) = ?")
+            params.append(t)
+
+        where_sql = ("WHERE " + " AND ".join(where) + " ") if where else ""
+
+        # --- total ---
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM questions q {where_sql}", tuple(params))
+            total = int(cur.fetchone()[0] or 0)
+        except sqlite3.OperationalError:
+            # fallback: JSON_EXTRACT niedostępny -> LIKE na JSON stringu
+            if t and use_json_extract:
+                where = [w for w in where if "json_extract" not in w]
+                params = [p for p in params if p != t]
+                where.append("LOWER(q.metadata) LIKE ?")
+                params.append(f'%"topic": "{t}"%')
+                where_sql = ("WHERE " + " AND ".join(where) + " ") if where else ""
+            cur.execute(f"SELECT COUNT(*) FROM questions q {where_sql}", tuple(params))
+            total = int(cur.fetchone()[0] or 0)
+
+        # --- lista ---
+        if with_quality:
+            base_sql = (
+                "SELECT q.id, q.kind, q.stem, q.options, q.answer, q.explanation, q.metadata, q.created_at, "
+                "       COALESCE(qq.avg_score, NULL) AS avg_score, COALESCE(qq.votes, 0) AS votes "
+                "FROM questions q "
+                "LEFT JOIN question_quality qq ON qq.question_id = q.id "
+            )
+        else:
+            base_sql = (
+                "SELECT q.id, q.kind, q.stem, q.options, q.answer, q.explanation, q.metadata, q.created_at, "
+                "       NULL AS avg_score, 0 AS votes "
+                "FROM questions q "
+            )
+
+        sql = base_sql + where_sql + "ORDER BY q.created_at DESC, q.id DESC LIMIT ? OFFSET ?"
+        params_list = list(params) + [limit, offset]
+
+        try:
+            cur.execute(sql, tuple(params_list))
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            # ten sam fallback dla listy (gdy JSON_EXTRACT nie ma)
+            if t and use_json_extract:
+                where = [w for w in where if "json_extract" not in w]
+                params2 = [p for p in params if p != t]
+                where.append("LOWER(q.metadata) LIKE ?")
+                params2.append(f'%"topic": "{t}"%')
+                where_sql = ("WHERE " + " AND ".join(where) + " ") if where else ""
+                sql = base_sql + where_sql + "ORDER BY q.created_at DESC, q.id DESC LIMIT ? OFFSET ?"
+                params_list = list(params2) + [limit, offset]
+                cur.execute(sql, tuple(params_list))
+                rows = cur.fetchall()
+            else:
+                raise
+
+        qids = [r[0] for r in rows]
+        citations_map: dict[str, list[dict]] = {qid: [] for qid in qids}
+
+        if with_citations and qids:
+            placeholders = ",".join(["?"] * len(qids))
+            cur.execute(
+                f"""
+                SELECT qc.question_id, s.filename, qc.page, qc.quote
+                FROM question_citations qc
+                JOIN sources s ON s.id = qc.source_id
+                WHERE qc.question_id IN ({placeholders})
+                ORDER BY qc.question_id ASC, s.filename ASC, qc.page ASC
+                """,
+                tuple(qids),
+            )
+            for qid, fname, page, quote in cur.fetchall():
+                citations_map.setdefault(qid, []).append(
+                    {"source": fname, "page": int(page), "quote": quote}
+                )
+
+        items = []
+        for (qid, qkind, stem, options, answer, explanation, metadata, created_at, avg_score, votes) in rows:
+            qobj = {
+                "kind": qkind,
+                "stem": stem,
+                "options": _json_loads_or_none(options),
+                "answer": answer,
+                "explanation": explanation,
+                "metadata": _json_loads_or_none(metadata) or {},
+                "citations": citations_map.get(qid, []) if with_citations else [],
+            }
+            out = {"question_id": qid, "question": qobj, "created_at": created_at}
+            if with_quality:
+                out["quality"] = {
+                    "avg_score": (float(avg_score) if avg_score is not None else None),
+                    "votes": int(votes or 0),
+                }
+            items.append(out)
+
+        return {"total": total, "items": items, "limit": limit, "offset": offset}
+    finally:
+        con.close()
