@@ -110,6 +110,34 @@ def _count_expl_tags(expl: str | None) -> int:
 
 def _strip_tags(text: str | None) -> str:
     return _TAG_RX.sub("", (text or "")).strip()
+def _force_single_expl_tag(expl: str | None, cites: list[dict]) -> str:
+    """
+    Normalizuje explanation tak, żeby miało DOKŁADNIE jeden tag [source|p.N]
+    + sensowne uzasadnienie. Ratuje przypadki, gdzie LLM daje 0 albo >1 tagów.
+    """
+    expl = (expl or "").strip()
+
+    tags = re.findall(r"\[([^\|\]]+)\|p\.(\d+)\]", expl)
+    if tags:
+        src, page = tags[0][0], int(tags[0][1])
+    elif cites:
+        src, page = str(cites[0].get("source")), int(cites[0].get("page"))
+    else:
+        return expl
+
+    rationale = _strip_tags(expl)
+    if len(rationale) < 12:
+        quote = ""
+        for c in cites:
+            try:
+                if str(c.get("source")) == src and int(c.get("page")) == page:
+                    quote = (c.get("quote") or "").strip()
+                    break
+            except Exception:
+                pass
+        rationale = quote if quote else "Uzasadnienie wynika z przytoczonego fragmentu."
+
+    return f"[{src}|p.{page}] {rationale}".strip()
 
 def _ensure_expl_has_rationale(expl: str, cites: list[dict]) -> str:
     """
@@ -247,14 +275,25 @@ def _validate_yn_obj(obj: dict) -> tuple[bool, str]:
 def _semantic_check_yn(body: str, stem: str, provider: str | None) -> tuple[bool, str | None]:
     """
     Z fragmentów oceń, czy zdanie (stem) jest prawdziwe.
-    Zwraca (ok, answer_from_checker) gdzie answer_from_checker to "TAK"/"NIE" lub None.
+    WAŻNE: jeśli checker nie da się sparsować -> nie blokujemy generowania (skip),
+    żeby nie wpadać w fallback.
     """
     if provider in (None, "none"):
         return True, None
 
-    prompt = f"""Użyj WYŁĄCZNIE fragmentów poniżej.
+    def run_check(strict: bool) -> str | None:
+        extra = ""
+        if strict:
+            extra = (
+                '\nBEZ markdown, BEZ komentarzy, BEZ uzasadnienia. '
+                'Zwróć tylko jedną linię JSON.\n'
+                'Przykład: {"answer":"TAK"}\n'
+            )
+
+        prompt = f"""Użyj WYŁĄCZNIE fragmentów poniżej.
 Oceń, jaka odpowiedź (TAK/NIE) jest poprawna na to pytanie.
 Jeśli nie wynika jednoznacznie z fragmentów, odpowiedz "NIE".
+{extra}
 Zwróć TYLKO JSON: {{"answer":"TAK"|"NIE"}}.
 
 Pytanie TAK/NIE:
@@ -264,22 +303,29 @@ Fragmenty:
 {body}
 """.strip()
 
-    resp = ask_llm(prompt, provider=provider)
-    if not resp:
-        return True, None
+        resp = ask_llm(prompt, provider=provider)
+        if not resp:
+            return None
 
-    obj = _extract_json(resp)
-    if isinstance(obj, dict) and obj.get("answer") in {"TAK", "NIE"}:
-        return True, obj["answer"]
+        obj = _extract_json(resp)
+        if isinstance(obj, dict) and obj.get("answer") in {"TAK", "NIE"}:
+            return obj["answer"]
 
-    # fallback: spróbuj wyciągnąć TAK/NIE z tekstu
-    txt = resp.upper()
-    if "TAK" in txt and "NIE" not in txt:
-        return True, "TAK"
-    if "NIE" in txt and "TAK" not in txt:
-        return True, "NIE"
+        txt = resp.upper()
+        if "TAK" in txt and "NIE" not in txt:
+            return "TAK"
+        if "NIE" in txt and "TAK" not in txt:
+            return "NIE"
 
-    return False, None
+        return None
+
+    ans = run_check(strict=False)
+    if ans is None:
+        ans = run_check(strict=True)
+
+    # nigdy nie blokuj generowania, jeśli nie umiemy sparsować checkera
+    return True, ans if ans in {"TAK", "NIE"} else None
+
 
 
 def gen_yes_no(ctx, topic=None, difficulty="medium", provider: str | None = None, variant: int = 1):
@@ -307,8 +353,8 @@ Fragmenty:
         llm = ask_llm(prompt, provider=provider)
         qobj = _extract_json(llm) if llm else None
         if isinstance(qobj, dict) and isinstance(qobj.get("explanation"), str):
-            # jeśli model dał tylko tag, dolep snippet z kontekstu (żeby walidacja przeszła)
             qobj["explanation"] = _ensure_expl_has_rationale(qobj["explanation"], cites)
+            qobj["explanation"] = _force_single_expl_tag(qobj["explanation"], cites)
 
         ok = False
         reason = "no json"
@@ -504,8 +550,10 @@ def _semantic_check_mcq(body: str, q: dict, provider: str | None) -> tuple[bool,
             )
 
         check_prompt = f"""Użyj WYŁĄCZNIE fragmentów poniżej.
-Wskaż, które opcje są PRAWDZIWE (wprost wspierane przez fragmenty). Reszta = FAŁSZ.
-Jeśli opcja nie wynika jednoznacznie z fragmentów, uznaj ją za FAŁSZ.
+Wskaż, które opcje są POPRAWNĄ odpowiedzią na pytanie (stem).
+- Jeśli pasuje więcej niż jedna opcja -> zwróć wszystkie pasujące.
+- Jeśli nie da się rozstrzygnąć jednoznacznie -> zwróć wszystkie, które mogą pasować.
+- Jeśli żadna nie wynika z fragmentów -> zwróć [].
 {extra}
 Zwróć TYLKO JSON:
 {{"correct":["a"|"b"|"c"|"d", ...]}}
@@ -516,6 +564,7 @@ Pytanie:
 Fragmenty:
 {body}
 """.strip()
+
 
         resp = ask_llm(check_prompt, provider=provider)
         if not resp:
