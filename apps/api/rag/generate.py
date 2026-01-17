@@ -518,6 +518,8 @@ def _validate_mcq_obj(obj: dict) -> tuple[bool, str]:
         return False, "missing stem"
     # zbyt ogólne/“wypisz” pytania robią wieloznaczność (np. "Jakie są ...?")
     s0 = stem.strip().lower()
+    if s0.startswith("co jest") or s0.startswith("czym jest"):
+        return False, 'stem "Co jest/Czym jest" często robi wieloznaczność — użyj "Jak nazywa się..."'
     if re.match(r"^(jakie\s+są|wymień|podaj)\b", s0):
         return False, "stem too broad (use one specific fact/definition)"
     if "cytowanym fragment" in s0:
@@ -599,7 +601,7 @@ Fragmenty:
 """.strip()
 
 
-        resp = ask_llm(check_prompt, provider=provider)
+        resp = ask_llm(check_prompt, format="json", provider=provider)
         if not resp:
             return None
 
@@ -643,7 +645,7 @@ Fragmenty:
 
     # nadal nie umiemy sparsować → SKIP (zamiast FAIL, bo teraz wpadasz w fallback MCQ)
     if letters == []:
-        return True, "skipped_semantic_check_parse_failed"
+        return False, "semantic_check_parse_failed"
 
     if len(letters) != 1:
         return False, f"semantic_check_expected_1_correct_got={letters}"
