@@ -257,3 +257,41 @@ flowchart TB
 
 
 ```
+
+```mermaid
+flowchart TB
+
+  %% --- Ingest ---
+  subgraph ING ["Etap A: Ingest materiałów"]
+    direction TB
+    U["Upload pliku (frontend)"]
+    A1["Endpoint /upload (FastAPI)"]
+    A2["Zapis pliku na dysk (data/sources)"]
+    A3["ingest_files(...)"]
+    A4["SQLite: sources + chunks"]
+    U --> A1 --> A2 --> A3 --> A4
+  end
+
+  %% --- RAG + LLM ---
+  subgraph GEN ["Etap B: Generowanie pytania"]
+    direction TB
+    B1["POST /gen/mcq lub /gen/yn"]
+    B2["rag_search(...)"]
+    B3["gen_mcq / gen_yes_no"]
+    B4["save_question_with_citations"]
+    B5["JSON do frontendu"]
+    B1 --> B2 --> B3 --> B4 --> B5
+  end
+
+  %% --- Ocena ---
+  subgraph RATE ["Opcjonalnie: ocena jakości"]
+    direction TB
+    C1["POST /rate"]
+    C2["INSERT ratings"]
+    C1 --> C2
+  end
+
+  A4 --> B1
+  C2 --> B2
+
+```
